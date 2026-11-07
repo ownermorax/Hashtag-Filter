@@ -1,0 +1,370 @@
+__id__ = "hashtag_filter"
+__name__ = "Hashtag Filter"
+__description__ = (
+    "Фильтр постов канала по хештегам: в канале остаются только посты с нужными тегами, "
+    "остальные скрываются. Можно несколько тегов — «любой из» или «все сразу». "
+    "Меню «⋮» в канале → «Фильтр по хештегам».\n\n"
+    "Show only channel posts with chosen hashtags (any or all of them). "
+    "Channel «⋮» → «Фильтр по хештегам»."
+)
+__author__ = "@ympuxyecoc"
+__version__ = "1.2.0"
+__min_version__ = "12.10.6"
+__category__ = ["tools"]
+
+import json
+import re
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from ui.settings import Header, Divider
+
+from java import jclass
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:
+    BulletinHelper = None
+
+TAG = "HashtagFilter"
+TAG_RE = re.compile(r"#(\w+)", re.UNICODE)
+MAX_GROUPS = 5000
+PAGE = 100
+
+
+def _jcls(name):
+    """java.lang.Class (find_class отдаёт обёртку Chaquopy без рефлексии)."""
+    loader = jclass("org.telegram.messenger.ApplicationLoader").applicationContext.getClassLoader()
+    return loader.loadClass(name)
+
+
+def _ui(fn):
+    def safe():
+        try:
+            fn()
+        except Exception as e:
+            log("%s ui: %r" % (TAG, e))
+    run_on_ui_thread(safe)
+
+
+def _toast(text, ok=True):
+    def show():
+        if BulletinHelper is None:
+            return
+        try:
+            (BulletinHelper.show_success if ok else BulletinHelper.show_error)(text)
+        except Exception:
+            pass
+    _ui(show)
+
+
+def _tags_of(text):
+    if not text:
+        return set()
+    return {t.lower() for t in TAG_RE.findall(str(text))}
+
+
+def _parse_tags(text):
+    """'#music rock, #Jazz' → ['music', 'rock', 'jazz'] (без повторов, порядок сохраняется)."""
+    out = []
+    for part in re.split(r"[\s,;]+", str(text)):
+        part = part.strip().lstrip("#").lower()
+        if part and re.fullmatch(r"\w+", part, re.UNICODE) and part not in out:
+            out.append(part)
+    return out
+
+
+class HashtagFilterPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._filters = {}      # did → {"tags": [...], "all": bool}
+        self._groups_ok = {}    # did → set(grouped_id), альбомы, где тег есть в подписи
+        try:
+            raw = self.get_setting("filters", "{}")
+            for k, v in json.loads(raw or "{}").items():
+                if v.get("tags"):
+                    self._filters[int(k)] = {"tags": list(v["tags"]), "all": bool(v.get("all"))}
+        except Exception as e:
+            log("%s load: %r" % (TAG, e))
+
+        # Тяжёлые хуки (на каждое сообщение) ставятся только пока открыт чат с фильтром,
+        # иначе висит лишь дешёвый хук на открытие/закрытие ChatActivity.
+        self._heavy = []        # unhook-объекты тяжёлых хуков
+        self._open = set()      # identityHashCode открытых ChatActivity с фильтром
+        CA = _jcls("org.telegram.ui.ChatActivity")
+        self.hook_all_methods(CA, "onFragmentCreate", before=self._on_chat_create)
+        self.hook_all_methods(CA, "onFragmentDestroy", after=self._on_chat_destroy)
+
+        for mt in (MenuItemType.CHAT_ACTION_MENU, MenuItemType.PROFILE_ACTION_MENU):
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=mt,
+                    text="Фильтр по хештегам",
+                    icon="menu_hashtag",
+                    on_click=self._on_menu,
+                ))
+            except Exception as e:
+                log("%s menu %s: %r" % (TAG, mt, e))
+
+    def create_settings(self):
+        n = len(self._filters)
+        return [
+            Header(text="Hashtag Filter"),
+            Divider(text="Откройте канал → «⋮» → «Фильтр по хештегам», впишите теги через пробел "
+                         "(#music #rock). Посты без этих тегов скрываются; служебные сообщения остаются. "
+                         "«Выключить» в том же окне возвращает все посты. Активных фильтров: %d." % n),
+        ]
+
+    def _save(self):
+        self.set_setting("filters", json.dumps({str(k): v for k, v in self._filters.items()}))
+
+    # --------------------------------------------------------------- хуки
+    @staticmethod
+    def _match(f, text):
+        tags = _tags_of(text)
+        if f["all"]:
+            return all(t in tags for t in f["tags"])
+        return any(t in tags for t in f["tags"])
+
+    @staticmethod
+    def _key(frag):
+        return int(jclass("java.lang.System").identityHashCode(frag))
+
+    def _on_chat_create(self, param):
+        try:
+            if not self._filters:
+                return
+            args = param.thisObject.getArguments()
+            if args is None:
+                return
+            cid, uid = int(args.getLong("chat_id", 0)), int(args.getLong("user_id", 0))
+            did = -cid if cid else uid
+            if did not in self._filters:
+                return
+            self._open.add(self._key(param.thisObject))
+            self._set_heavy(True)
+        except Exception as e:
+            log("%s create: %r" % (TAG, e))
+
+    def _on_chat_destroy(self, param):
+        try:
+            k = self._key(param.thisObject)
+            if k in self._open:
+                self._open.discard(k)
+                if not self._open:
+                    self._set_heavy(False)
+        except Exception as e:
+            log("%s destroy: %r" % (TAG, e))
+
+    def _set_heavy(self, on):
+        if on and not self._heavy:
+            MO = _jcls("org.telegram.messenger.MessageObject")
+            MC = _jcls("org.telegram.messenger.MessagesController")
+            # setType вызывается и из конструкторов — отдельный хук на них не нужен
+            for res in (self.hook_all_methods(MO, "setType", after=self._after_set_type),
+                        self.hook_all_methods(MC, "processLoadedMessages", before=self._before_loaded),
+                        self.hook_all_methods(MC, "loadMessagesInternal", before=self._before_load)):
+                self._heavy.extend(res or [])
+        elif not on and self._heavy:
+            for u in self._heavy:
+                try:
+                    self.unhook_method(u)
+                except Exception as e:
+                    log("%s unhook: %r" % (TAG, e))
+            self._heavy = []
+            self._groups_ok.clear()
+
+    def _before_load(self, param):
+        """Канал с фильтром грузим страницами по 100 (максимум сервера), а не по 20–30:
+        большая часть постов скрыта, и мелкими страницами до нужных идёт много запросов подряд."""
+        try:
+            if self._filters and int(param.args[0]) in self._filters and int(param.args[3]) < PAGE:
+                param.args[3] = jclass("java.lang.Integer")(PAGE)
+        except Exception as e:
+            log("%s load: %r" % (TAG, e))
+
+    def _before_loaded(self, param):
+        """Заранее запоминаем альбомы с нужным тегом: подпись лежит только на одном фото."""
+        try:
+            if not self._filters:
+                return
+            did = int(param.args[2])
+            f = self._filters.get(did)
+            if f is None:
+                return
+            res = param.args[0]
+            if res is None or res.messages is None:
+                return
+            ok = self._groups_ok.setdefault(did, set())
+            msgs = res.messages
+            for i in range(msgs.size()):
+                m = msgs.get(i)
+                gid = int(m.grouped_id)
+                if gid and self._match(f, m.message):
+                    ok.add(gid)
+            if len(ok) > MAX_GROUPS:
+                ok.clear()
+        except Exception as e:
+            log("%s loaded: %r" % (TAG, e))
+
+    def _after_set_type(self, param):
+        try:
+            if not self._filters:
+                return
+            obj = param.thisObject
+            if obj is None:
+                return
+            # сначала самая дешёвая проверка: чужие чаты отсекаются одним вызовом
+            f = self._filters.get(int(obj.getDialogId()))
+            if f is None or obj.type < 0:
+                return
+            mo = obj.messageOwner
+            if mo is None or mo.action is not None or obj.isSponsored():
+                return
+            if self._match(f, mo.message):
+                gid = int(mo.grouped_id)
+                if gid:
+                    self._groups_ok.setdefault(int(obj.getDialogId()), set()).add(gid)
+                return
+            gid = int(mo.grouped_id)
+            if gid and gid in self._groups_ok.get(int(obj.getDialogId()), ()):
+                return
+            obj.type = -1
+        except Exception as e:
+            log("%s type: %r" % (TAG, e))
+
+    # ---------------------------------------------------------------- меню
+    def _on_menu(self, context=None):
+        did = None
+        try:
+            if isinstance(context, dict):
+                did = context.get("dialog_id")
+        except Exception:
+            pass
+        frag = get_last_fragment()
+        if not did and frag is not None:
+            try:
+                did = frag.getDialogId()
+            except Exception:
+                did = None
+        if not did:
+            _toast("Не удалось определить чат", ok=False)
+            return
+        _ui(lambda: self._ask(int(did)))
+
+    def _seen_tags(self, did):
+        """Теги из уже загруженных постов открытого чата — для подсказки."""
+        count = {}
+        frag = get_last_fragment()
+        try:
+            if frag is None or int(frag.getDialogId()) != did:
+                return []
+            fld = _jcls("org.telegram.ui.ChatActivity").getDeclaredField("messages")
+            fld.setAccessible(True)
+            msgs = fld.get(frag)
+            for i in range(min(msgs.size(), 500)):
+                mo = msgs.get(i).messageOwner
+                if mo is not None:
+                    for t in _tags_of(mo.message):
+                        count[t] = count.get(t, 0) + 1
+        except Exception as e:
+            log("%s seen: %r" % (TAG, e))
+        return sorted(count, key=lambda t: -count[t])[:20]
+
+    def _ask(self, did):
+        from ui.alert import AlertDialogBuilder
+        frag = get_last_fragment()
+        act = frag.getParentActivity() if frag is not None else None
+        if act is None:
+            return
+        LinearLayout = jclass("android.widget.LinearLayout")
+        EditText = jclass("android.widget.EditText")
+        TextView = jclass("android.widget.TextView")
+        CheckBox = jclass("android.widget.CheckBox")
+        AU = jclass("org.telegram.messenger.AndroidUtilities")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        cur = self._filters.get(did)
+
+        layout = LinearLayout(act)
+        layout.setOrientation(1)
+        pad = int(AU.dp(20.0))
+        layout.setPadding(pad, int(AU.dp(8.0)), pad, 0)
+
+        hint = TextView(act)
+        hint.setText("Теги через пробел или запятую, «#» можно не писать.")
+        hint.setTextColor(Theme.getColor(Theme.key_dialogTextGray2))
+        hint.setTextSize(1, 13.0)
+        layout.addView(hint)
+
+        et = EditText(act)
+        et.setHint("#music #rock")
+        et.setText(" ".join("#" + t for t in cur["tags"]) if cur else "")
+        et.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        et.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+        layout.addView(et)
+
+        cb = CheckBox(act)
+        cb.setText("Пост должен содержать все теги (иначе — любой)")
+        cb.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        cb.setChecked(bool(cur and cur["all"]))
+        layout.addView(cb)
+
+        seen = self._seen_tags(did) if cur is None else []
+        if seen:
+            tv = TextView(act)
+            tv.setText("Встречаются в канале: " + " ".join("#" + t for t in seen))
+            tv.setTextColor(Theme.getColor(Theme.key_dialogTextGray2))
+            tv.setTextSize(1, 13.0)
+            tv.setTextIsSelectable(True)
+            tv.setPadding(0, int(AU.dp(6.0)), 0, 0)
+            layout.addView(tv)
+
+        def apply(bld, w):
+            tags = _parse_tags(et.getText())
+            if not tags:
+                _toast("Впишите хотя бы один хештег", ok=False)
+                return
+            self._filters[did] = {"tags": tags, "all": bool(cb.isChecked())}
+            self._groups_ok.pop(did, None)
+            self._save()
+            self._reopen(did)
+            _toast(("Все из: " if cb.isChecked() else "Любой из: ") + " ".join("#" + t for t in tags))
+
+        def off(bld, w):
+            self._filters.pop(did, None)
+            self._groups_ok.pop(did, None)
+            self._save()
+            self._reopen(did)
+            _toast("Фильтр выключен")
+
+        b = AlertDialogBuilder(act)
+        b.set_title("Фильтр по хештегам")
+        b.set_view(layout)
+        b.set_positive_button("Применить", apply)
+        b.set_negative_button("Отмена")
+        if cur:
+            b.set_neutral_button("Выключить", off)
+        b.show()
+
+    def _reopen(self, did):
+        """Перезагрузить открытый чат, чтобы скрытие применилось к уже загруженным постам."""
+        def go():
+            frag = get_last_fragment()
+            if frag is None:
+                return
+            same = False
+            try:
+                same = (frag.getClass().getName() == "org.telegram.ui.ChatActivity"
+                        and int(frag.getDialogId()) == did)
+            except Exception:
+                pass
+            if not same:
+                return
+            Bundle = jclass("android.os.Bundle")
+            args = Bundle()
+            if did < 0:
+                args.putLong("chat_id", -did)
+            else:
+                args.putLong("user_id", did)
+            frag.presentFragment(jclass("org.telegram.ui.ChatActivity")(args), True)
+        _ui(go)
